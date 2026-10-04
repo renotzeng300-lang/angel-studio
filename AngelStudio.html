@@ -41,7 +41,7 @@ aside{overflow-y:auto;border-right:1px solid var(--line);padding:16px 18px 28px;
 .sec{margin-bottom:18px}
 .sec h3{margin:0 0 8px;font-size:12px;font-weight:500;letter-spacing:.14em;color:var(--muted);display:flex;align-items:center;gap:8px}
 .sec h3 .grow{flex:1}
-.seg{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.seg{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}
 .seg button{border:1px solid var(--line);background:var(--panel);border-radius:9px;padding:8px 6px;text-align:left;line-height:1.3}
 .seg button b{display:block;font-size:13px;font-weight:500}
 .seg button span{font-size:11px;color:var(--dim)}
@@ -140,6 +140,11 @@ main{overflow-y:auto;padding:16px 20px 40px}
       <h3>模型</h3>
       <div class="seg" id="modelSeg"></div>
       <div class="note" id="modelNote"></div>
+      <div id="loraBox" style="display:none;margin-top:10px">
+        <div class="row"><div><span class="lbl">選擇 LoRA</span><select id="loraSel"></select></div>
+          <div style="max-width:150px"><span class="lbl">強度 <b id="loraScaleVal">1.0</b></span><input type="range" id="loraScale" min="0.5" max="1.5" step="0.05" value="1.0" style="width:100%;accent-color:var(--gold)"></div></div>
+        <div class="note" id="loraTrig"></div>
+      </div>
     </div>
 
     <div class="sec">
@@ -305,8 +310,22 @@ const MODELS = {
     maxRefs:8, safety:[1,6,4], kind:'nano',
     note:'Google 的模型，多張參考照的臉部一致性很強，也比較會寫中文字。US$0.15／張（4K 為 0.30）。',
     cost:(mp,refs,res)=>res==='4K'?0.30:0.15
+  },
+  lora: {
+    name:'專屬 LoRA', sub:'布萊恩臉部模型', t2i:'fal-ai/flux-lora', edit:null,
+    maxRefs:99, safety:null, kind:'lora',
+    note:'用你訓練的 LoRA 生圖，提示詞會自動加上觸發詞。不使用參考圖與角色庫。約 US$0.035／張。',
+    cost:(mp)=>0.035*Math.max(1,mp)
   }
 };
+function getLoras(){
+  let L=ls.get('loras',null);
+  if(!L){ L=[]; const f=ls.get('lora_brian_face',null), b=ls.get('lora_brian',null);
+    if(f) L.push({name:'布萊恩（臉部版）',url:f.url,trigger:f.trigger||'BRNTW'});
+    if(b) L.push({name:'布萊恩（全身版）',url:b.url,trigger:b.trigger||'BRNTW'});
+    if(L.length) ls.set('loras',L); }
+  return L||[];
+}
 const FLUX_SIZE = {
   '1:1':['square_hd',1024,1024], '3:4':['portrait_4_3',768,1024], '4:3':['landscape_4_3',1024,768],
   '9:16':['portrait_16_9',576,1024], '16:9':['landscape_16_9',1024,576],
@@ -366,10 +385,14 @@ function renderModels(){
     sf.innerHTML=Array.from({length:b-a+1},(_,i)=>a+i).map(v=>`<option value="${v}" ${v==cur?'selected':''}>${v}${v==a?'（最嚴格）':v==b?'（最寬鬆）':v==d?'（預設）':''}</option>`).join('');
   } else { sf.innerHTML='<option>此模型為開關式</option>'; sf.disabled=true; }
   $('#resWrap').style.display = m.kind==='nano'?'':'none';
+  const isL=m.kind==='lora'; $('#loraBox').style.display=isL?'':'none';
+  if(isL){ const L=getLoras(), cur=ls.get('loraSel',0); $('#loraSel').innerHTML=L.map((l,i)=>`<option value="${i}" ${i==cur?'selected':''}>${esc(l.name)}</option>`).join('')||'<option>（尚無 LoRA）</option>'; const lo=L[$('#loraSel').value]; $('#loraTrig').textContent=lo?`觸發詞：${lo.trigger}（沒寫會自動加在最前面）。此模式不使用角色庫與參考圖。`:''; }
   updateEst();
 }
 $('#modelSeg').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b)return; state.model=b.dataset.k; ls.set('model',state.model); renderModels(); });
 $('#safety').addEventListener('change',e=>ls.set('safety_'+state.model,+e.target.value));
+$('#loraSel').addEventListener('change',e=>{ ls.set('loraSel',+e.target.value); renderModels(); });
+$('#loraScale').addEventListener('input',e=>{ $('#loraScaleVal').textContent=(+e.target.value).toFixed(2); updateEst(); });
 
 /* ============ 圖片縮放 ============ */
 function fileToDataURL(file,max=1536){ return new Promise((res,rej)=>{
@@ -460,6 +483,15 @@ function collectRefs(){
 function buildJob(){
   const m=MODELS[state.model];
   let text=$('#prompt').value.trim();
+  if(m.kind==='lora'){
+    const L=getLoras(); const lo=L[+$('#loraSel').value||0];
+    if(!lo) throw new Error('還沒有可用的 LoRA。');
+    const scale=+$('#loraScale').value;
+    if(!text.includes(lo.trigger)) text=lo.trigger+', '+text;
+    const ratio=$('#ratio').value==='auto'?'3:4':$('#ratio').value; const [sz,w,h]=FLUX_SIZE[ratio];
+    const p={prompt:text,loras:[{path:lo.url,scale}],image_size:sz,num_inference_steps:28,guidance_scale:3.5,num_images:1,enable_safety_checker:true,output_format:$('#fmt').value};
+    return {endpoint:m.t2i,payload:p,seedRaw:$('#seed').value.trim(),cost:m.cost(w*h/1e6),model:state.model,ratio,promptShown:$('#prompt').value.trim(),refCount:0,chars:[],loraName:lo.name,loraScale:scale};
+  }
   const {refs,descs}=collectRefs();
   if(refs.length>m.maxRefs) throw new Error(`${m.name} 最多只能放 ${m.maxRefs} 張參考圖，目前有 ${refs.length} 張。`);
   if(descs.length) text='角色設定｜'+descs.join('；')+'\n'+text;
@@ -487,6 +519,7 @@ function buildJob(){
 }
 function updateEst(){
   try{ const j=buildJob(); const n=Math.max(1,Math.min(40,+$('#count').value||1));
+    if(j.loraName){ $('#est').textContent=`${j.loraName} · 強度 ${j.loraScale} · ${n} 張，約 US$${(j.cost*n).toFixed(2)}`; return; }
     $('#est').textContent=`${MODELS[j.model].name}${j.refCount?` · ${j.refCount} 張參考圖（編輯模式）`:' · 文生圖'} · ${n} 張，約 US$${(j.cost*n).toFixed(2)}`;
   }catch(e){ $('#est').textContent=e.message; }
 }
@@ -524,7 +557,7 @@ async function runOne(job,card){
   for(const im of imgs){
     let blob=null;
     try{ if(im.url.startsWith('data:')) blob=await (await fetch(im.url)).blob(); else { const r=await fetch(im.url); if(r.ok) blob=await r.blob(); } }catch(e){}
-    const item={id:uid(),blob,url:im.url,prompt:job.promptShown,fullPrompt:job.payload.prompt,model:job.model,endpoint:job.endpoint,ratio:job.ratio,seed:out.seed??payload.seed??null,chars:job.chars,refCount:job.refCount,createdAt:Date.now(),w:im.width,h:im.height,fmt:job.payload.output_format};
+    const item={id:uid(),blob,url:im.url,prompt:job.promptShown,fullPrompt:job.payload.prompt,model:job.model,endpoint:job.endpoint,ratio:job.ratio,seed:out.seed??payload.seed??null,chars:job.chars,refCount:job.refCount,loraName:job.loraName,loraScale:job.loraScale,createdAt:Date.now(),w:im.width,h:im.height,fmt:job.payload.output_format};
     try{ await dbPut('images',item); }catch(e){} saved.push(item);
   }
   return saved;
@@ -592,8 +625,8 @@ $('#btnDelSel').onclick=async()=>{ const s=selectedItems(); if(!s.length){toast(
 function openView(idx){
   const list=filtered(); if(idx<0||idx>=list.length)return; state.viewIdx=idx; const it=list[idx];
   $('#vImg').src=imgURL(it);
-  $('#vMeta').innerHTML=`模型：<b>${esc(MODELS[it.model]?.name||it.model)}</b>${it.refCount?`（參考圖 ${it.refCount} 張）`:''}<br>${it.chars?.length?'角色：<b>'+esc(it.chars.join('、'))+'</b><br>':''}比例：<b>${esc(it.ratio)}</b>　Seed：<b>${it.seed??'—'}</b><br>時間：<b>${new Date(it.createdAt).toLocaleString('zh-TW')}</b>`;
-  $('#vPrompt').textContent=it.prompt;
+  $('#vMeta').innerHTML=`模型：<b>${esc(MODELS[it.model]?.name||it.model)}</b>${it.refCount?`（參考圖 ${it.refCount} 張）`:''}<br>${it.loraName?'LoRA：<b>'+esc(it.loraName)+'</b>　強度：<b>'+it.loraScale+'</b><br>':''}${it.chars?.length?'角色：<b>'+esc(it.chars.join('、'))+'</b><br>':''}比例：<b>${esc(it.ratio)}</b>　Seed：<b>${it.seed??'—'}</b><br>時間：<b>${new Date(it.createdAt).toLocaleString('zh-TW')}</b>`;
+  $('#vPrompt').textContent=it.prompt+((it.fullPrompt&&it.fullPrompt!==it.prompt)?'\n\n— 實際送出的提示詞 —\n'+it.fullPrompt:'');
   $('#mView').classList.add('on');
 }
 function curItem(){ return filtered()[state.viewIdx]; }
