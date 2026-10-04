@@ -164,7 +164,9 @@ main{overflow-y:auto;padding:16px 20px 40px}
       <h3>提示詞<span class="grow"></span>
         <select id="tplSelect" style="width:auto;padding:4px 8px;font-size:12px"><option value="">— 套用模板 —</option></select>
       </h3>
-      <textarea id="prompt" placeholder="描述你要的畫面……（中英文都可以）"></textarea>
+      <textarea id="prompt" placeholder="描述你要的畫面……用中文寫就可以"></textarea>
+      <div class="row" style="margin-top:6px"><span class="lbl" style="flex:0 0 auto;margin:0">中文翻譯</span>
+        <select id="trMode" style="padding:5px 8px;font-size:12.5px"><option value="auto">自動（LoRA／Flux 才翻）</option><option value="always">永遠翻成英文</option><option value="never">不翻譯</option></select></div>
       <div class="row" style="margin-top:6px">
         <button class="btn sm ghost" id="btnSaveTpl">💾 存成模板</button>
         <button class="btn sm ghost danger" id="btnDelTpl">刪除目前模板</button>
@@ -198,7 +200,7 @@ main{overflow-y:auto;padding:16px 20px 40px}
       <details>
         <summary>進階設定</summary>
         <div class="grid2">
-          <div><span class="lbl">Seed（留空＝隨機）</span><input type="number" id="seed" placeholder="隨機"></div>
+          <div><span class="lbl">Seed（留空＝隨機）</span><input type="text" inputmode="numeric" id="seed" placeholder="隨機"></div>
           <div><span class="lbl">輸出格式</span><select id="fmt"><option value="png">PNG</option><option value="jpeg">JPEG</option></select></div>
           <div><span class="lbl">安全過濾寬鬆度</span><select id="safety"></select></div>
           <div id="resWrap"><span class="lbl">解析度（Nano Banana）</span><select id="res"><option>1K</option><option selected>2K</option><option>4K</option></select></div>
@@ -482,7 +484,7 @@ function collectRefs(){
 }
 function buildJob(){
   const m=MODELS[state.model];
-  let text=$('#prompt').value.trim();
+  let text=(state.trOverride??$('#prompt').value).trim();
   if(m.kind==='lora'){
     const L=getLoras(); const lo=L[+$('#loraSel').value||0];
     if(!lo) throw new Error('還沒有可用的 LoRA。');
@@ -528,7 +530,7 @@ function updateEst(){
 /* ============ fal 呼叫 ============ */
 async function falFetch(url,opt={}){
   const r=await fetch(url,{...opt,headers:{'Authorization':'Key '+getKey(),'Content-Type':'application/json',...(opt.headers||{})}});
-  let body=null; const txt=await r.text(); try{ body=JSON.parse(txt);}catch(e){ body={raw:txt}; }
+  let body=null; const txt=await r.text(); try{ body=JSON.parse(txt); if(body&&typeof body==='object'){ const sm=txt.match(/"seed"\s*:\s*(\d+)/); if(sm) body.__seed=sm[1]; } }catch(e){ body={raw:txt}; }
   if(!r.ok){ const d=body?.detail; let msg=typeof d==='string'?d:Array.isArray(d)?d.map(x=>x.msg||JSON.stringify(x)).join('；'):(body?.message||body?.raw||('HTTP '+r.status));
     if(r.status===401||r.status===403) msg='金鑰無效或沒有權限（'+msg+'）';
     if(r.status===402||/balance|credit|billing/i.test(msg)) msg='fal 帳戶餘額不足，請到 fal.ai 儲值。（'+msg+'）';
@@ -537,8 +539,9 @@ async function falFetch(url,opt={}){
 }
 async function runOne(job,card){
   const payload={...job.payload};
-  if(job.seedRaw!=='') payload.seed=(+job.seedRaw)+job.offset;
-  const sub=await falFetch(`${FAL_BASE}/${job.endpoint}`,{method:'POST',body:JSON.stringify(payload)});
+  let seedStr=null; if(/^\d+$/.test(job.seedRaw||'')) seedStr=(BigInt(job.seedRaw)+BigInt(job.offset)).toString();
+  let bodyStr=JSON.stringify(payload); if(seedStr) bodyStr=bodyStr.replace(/}$/,`,"seed":${seedStr}}`);
+  const sub=await falFetch(`${FAL_BASE}/${job.endpoint}`,{method:'POST',body:bodyStr});
   const statusUrl=sub.status_url||`${FAL_BASE}/${job.endpoint}/requests/${sub.request_id}/status`;
   const respUrl=sub.response_url||`${FAL_BASE}/${job.endpoint}/requests/${sub.request_id}/response`;
   const t0=Date.now();
@@ -557,7 +560,7 @@ async function runOne(job,card){
   for(const im of imgs){
     let blob=null;
     try{ if(im.url.startsWith('data:')) blob=await (await fetch(im.url)).blob(); else { const r=await fetch(im.url); if(r.ok) blob=await r.blob(); } }catch(e){}
-    const item={id:uid(),blob,url:im.url,prompt:job.promptShown,fullPrompt:job.payload.prompt,model:job.model,endpoint:job.endpoint,ratio:job.ratio,seed:out.seed??payload.seed??null,chars:job.chars,refCount:job.refCount,loraName:job.loraName,loraScale:job.loraScale,createdAt:Date.now(),w:im.width,h:im.height,fmt:job.payload.output_format};
+    const item={id:uid(),blob,url:im.url,prompt:job.promptShown,fullPrompt:job.payload.prompt,model:job.model,endpoint:job.endpoint,ratio:job.ratio,seed:out.__seed??seedStr??(out.seed!=null?String(out.seed):null),chars:job.chars,refCount:job.refCount,loraName:job.loraName,loraScale:job.loraScale,createdAt:Date.now(),w:im.width,h:im.height,fmt:job.payload.output_format};
     try{ await dbPut('images',item); }catch(e){} saved.push(item);
   }
   return saved;
@@ -583,10 +586,24 @@ function makeCard(){
     fail(msg){ el.className='card failed'; el.innerHTML=`<div style="font-size:22px">⚠</div><div>生成失敗</div><div class="err">${esc(msg)}</div><button class="btn sm">移除</button>`; el.querySelector('button').onclick=()=>{ el.remove(); state.jobs=state.jobs.filter(c=>c.el!==el); refreshEmpty(); }; }
   };
 }
-$('#btnGo').onclick=()=>{
+const TR_SYS=`You translate Chinese image-generation requests into one fluent English prompt for the Flux image model. Rules: output ONLY the English prompt, no quotes, no explanations. Keep every detail the user wrote (people, body, clothing, pose, setting, lighting, camera, mood) and do not invent new story elements. Make it vivid and concrete, add photographic terms only when they match the request (e.g. cinematic film still, 35mm, rich detail). Keep any ALL-CAPS tokens such as BRNTW exactly as written.`;
+function needTr(){ const mode=$('#trMode').value, m=MODELS[state.model], txt=$('#prompt').value; if(mode==='never'||!/[\u3400-\u9fff]/.test(txt)) return false; if(mode==='always') return true; return m.kind==='lora'||m.kind==='flux'; }
+async function translatePrompt(txt){
+  let sys=TR_SYS; const m=MODELS[state.model];
+  if(m.kind==='lora'){ const lo=getLoras()[+$('#loraSel').value||0]; if(lo){ const nm=lo.name.split('（')[0]; sys+=` The main character is called ${nm}; write him as "${lo.trigger}, a man" instead of his name.`; } }
+  const r=await fetch('https://fal.run/fal-ai/any-llm',{method:'POST',headers:{'Authorization':'Key '+getKey(),'Content-Type':'application/json'},body:JSON.stringify({model:'google/gemini-2.5-flash',system_prompt:sys,prompt:txt,temperature:0.3})});
+  const j=await r.json(); if(!r.ok||!j.output) throw new Error('中文翻譯失敗：'+(j.detail?JSON.stringify(j.detail).slice(0,120):r.status));
+  return j.output.trim().replace(/^["「]|["」]$/g,'');
+}
+$('#btnGo').onclick=async()=>{
   if(!getKey()){ openSettings(); toast('先設定 fal API 金鑰'); return; }
   if(!$('#prompt').value.trim()){ toast('請先寫提示詞'); $('#prompt').focus(); return; }
-  let base; try{ base=buildJob(); }catch(e){ toast(e.message,4000); return; }
+  state.trOverride=null;
+  if(needTr()){ const btn=$('#btnGo'); btn.disabled=true; btn.textContent='翻譯中文提示詞…';
+    try{ state.trOverride=await translatePrompt($('#prompt').value.trim()); addSpend(0.001); }catch(e){ toast(e.message,5000); btn.disabled=false; updateGoBtn(); return; }
+    btn.disabled=false; updateGoBtn(); }
+  let base; try{ base=buildJob(); }catch(e){ state.trOverride=null; toast(e.message,4000); return; }
+  state.trOverride=null;
   const n=Math.max(1,Math.min(40,+$('#count').value||1));
   for(let i=0;i<n;i++){ const card=makeCard(); state.jobs.unshift(card); queue.push({job:{...base,offset:i},card}); }
   renderGrid(); pump();
